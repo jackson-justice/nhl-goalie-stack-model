@@ -7,7 +7,7 @@ import requests
 
 STANDINGS_URL = "https://api-web.nhle.com/v1/standings/now"
 CLUB_STATS_URL = "https://api-web.nhle.com/v1/club-stats/{team}/now"
-OUTPUT_FILE = Path(__file__).with_name("team_data.csv")
+OUTPUT_FILE = Path(__file__).resolve().parent.parent / "data" / "team_data.csv"
 
 
 class TeamDataUpdateError(RuntimeError):

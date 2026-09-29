@@ -8,12 +8,58 @@ import pandas as pd
 import requests
 
 
-MASTER_FILE = Path(__file__).with_name("goalie_stack_games_master.csv")
-MODEL_ARTIFACT_PATH = Path(__file__).with_name("stack_predictive_model.json")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+MASTER_FILE = DATA_DIR / "goalie_stack_games_master.csv"
+MODEL_ARTIFACT_PATH = DATA_DIR / "stack_predictive_model.json"
 GAMECENTER_LANDING_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/landing"
 
 ROLLING_WINDOWS = (5, 10)
 EWM_ALPHA = 0.35
+
+TEAM_PRIOR_FIELDS = ["gf", "ga", "sf", "sa", "goalie_fp", "game_total_goals", "game_total_shots", "game_stack_fp"]
+GOALIE_PRIOR_FIELDS = [
+    ("goalie_fp", "goalie_fp"),
+    ("saves", "goalie_saves"),
+    ("shots_against", "goalie_shots_against"),
+    ("save_pct", "goalie_save_pct"),
+]
+# How many league-average games to blend into last season's numbers when seeding a new season.
+# Shot volume carries over year to year (r ~0.6); goals and goalie results much less (r ~0.4 / ~0.15).
+TEAM_CARRYOVER_SHRINK = {"sf": 50.0, "sa": 50.0, "game_total_shots": 50.0}
+TEAM_CARRYOVER_SHRINK_DEFAULT = 120.0
+GOALIE_CARRYOVER_SHRINK = 200.0
+# Goalies with no earlier NHL games start from how new goalies have performed over their first starts.
+ROOKIE_PRIOR_STARTS = 20
+ROOKIE_PRIOR_MIN_SAMPLES = 50
+
+# The model uses a small core of features. With ~4,000 noisy games, the full ~200-feature set
+# plus team one-hots overfit and did no better than predicting the league average on 2025-26.
+MODEL_FEATURES = [
+    "season_expected_goals",
+    "season_expected_shots",
+    "ewm_expected_goals",
+    "ewm_expected_shots",
+    "venue_expected_goals",
+    "venue_expected_shots",
+    "season_pace_mean",
+    "season_stack_env_mean",
+    "goalie_fp_sum",
+    "goalie_fp_form_sum",
+    "goalie_save_pct_mean",
+    "goalie_save_pct_form_mean",
+    "away_home_goalie_fp_form_sum",
+    "goalie_shots_against_mean",
+    "rest_sum",
+    "back_to_back_count",
+    "goalie_start_share_sum",
+]
+USE_TEAM_ONE_HOTS = False
+CANDIDATE_ALPHAS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0, 100000.0]
+# Tiers are percentiles of out-of-sample predictions: CORE = top 10% of games, STRONG = next 15%, etc.
+TIER_PERCENTILES = [("CORE STACK", 90), ("STRONG STACK", 75), ("THIN EDGE STACK", 55), ("LEAN STACK", 40)]
+TIER_WINDOW_GAMES = 500
+CV_FOLD_STARTS = (0.5, 0.6, 0.7, 0.8, 0.9)
+CV_FOLD_SIZE = 0.1
 
 
 class PredictiveStackModelError(RuntimeError):
@@ -125,12 +171,88 @@ def compute_priors(games_df):
     records = list(_iter_team_records(games_df))
     goalie_records = list(_iter_goalie_records(games_df))
     priors = {}
-    for field in ["gf", "ga", "sf", "sa", "goalie_fp", "game_total_goals", "game_total_shots", "game_stack_fp"]:
+    for field in TEAM_PRIOR_FIELDS:
         priors[field] = float(pd.Series(record[field] for record in records).mean())
     for field in ["saves", "shots_against", "save_pct"]:
         priors[f"goalie_{field}"] = float(pd.Series(record[field] for record in goalie_records).mean())
     priors["rest_days"] = 3.0
     priors["games_played"] = 10.0
+
+    # Goalies first seen after the dataset's opening season are treated as new to the league.
+    goalie_df = pd.DataFrame(goalie_records)
+    first_season = goalie_df.groupby("goalie_id")["season"].transform("min")
+    start_number = goalie_df.groupby("goalie_id").cumcount()
+    rookies = goalie_df[(first_season > goalie_df["season"].min()) & (start_number < ROOKIE_PRIOR_STARTS)]
+    for field, prior_key in GOALIE_PRIOR_FIELDS:
+        if len(rookies) >= ROOKIE_PRIOR_MIN_SAMPLES:
+            priors[f"rookie_{prior_key}"] = float(rookies[field].mean())
+        else:
+            priors[f"rookie_{prior_key}"] = priors[prior_key]
+    return priors
+
+
+def season_for_date(date):
+    """NHL season code (e.g. 20262027) for a date; seasons roll over in August."""
+    ts = pd.Timestamp(date)
+    start_year = ts.year if ts.month >= 8 else ts.year - 1
+    return start_year * 10000 + start_year + 1
+
+
+def previous_season(season):
+    return int(season) - 10001
+
+
+def _shrink_toward(values, prior, shrink):
+    return float((values.sum() + shrink * prior) / (len(values) + shrink))
+
+
+def compute_carryover_priors(games_df, priors, extra_seasons=()):
+    """Per-season starting points for teams and goalies, built only from earlier seasons."""
+    team_records = pd.DataFrame(_iter_team_records(games_df))
+    goalie_records = pd.DataFrame(_iter_goalie_records(games_df))
+    seasons = sorted(set(games_df["season"].astype(int)) | {int(season) for season in extra_seasons})
+    team_priors = {}
+    goalie_priors = {}
+    seasons_with_history = set()
+
+    for season in seasons:
+        last_season = team_records[team_records["season"] == previous_season(season)]
+        for team, group in last_season.groupby("team"):
+            team_priors[(season, team)] = {
+                field: _shrink_toward(
+                    group[field],
+                    priors[field],
+                    TEAM_CARRYOVER_SHRINK.get(field, TEAM_CARRYOVER_SHRINK_DEFAULT),
+                )
+                for field in TEAM_PRIOR_FIELDS
+            }
+
+        earlier = goalie_records[goalie_records["season"] < season]
+        if earlier.empty:
+            continue
+        seasons_with_history.add(season)
+        for goalie_id, group in earlier.groupby("goalie_id"):
+            goalie_priors[(season, int(goalie_id))] = {
+                prior_key: _shrink_toward(group[field], priors[prior_key], GOALIE_CARRYOVER_SHRINK)
+                for field, prior_key in GOALIE_PRIOR_FIELDS
+            }
+
+    return {"team": team_priors, "goalie": goalie_priors, "seasons_with_history": seasons_with_history}
+
+
+def team_priors_for(carryover, priors, season, team):
+    overrides = carryover["team"].get((int(season), team)) if carryover else None
+    return {**priors, **overrides} if overrides else priors
+
+
+def goalie_priors_for(carryover, priors, season, goalie_id):
+    if not carryover or goalie_id is None:
+        return priors
+    overrides = carryover["goalie"].get((int(season), int(goalie_id)))
+    if overrides:
+        return {**priors, **overrides}
+    if int(season) in carryover["seasons_with_history"]:
+        return {**priors, **{key: priors[f"rookie_{key}"] for _, key in GOALIE_PRIOR_FIELDS}}
     return priors
 
 
@@ -179,7 +301,7 @@ def summarize_team_history(history, game_date, current_is_home, priors):
                 break
         summary["same_venue_streak"] = float(streak)
 
-    for field in ["gf", "ga", "sf", "sa", "goalie_fp", "game_total_goals", "game_total_shots", "game_stack_fp"]:
+    for field in TEAM_PRIOR_FIELDS:
         summary[f"season_{field}"] = _smoothed_mean(values(field, history), priors[field], shrink=8.0)
         summary[f"form5_{field}"] = _smoothed_mean(values(field, recent5), priors[field], shrink=3.0)
         summary[f"form10_{field}"] = _smoothed_mean(values(field, recent10), priors[field], shrink=4.0)
@@ -222,12 +344,7 @@ def summarize_goalie_history(goalie_history, team_history, game_date, current_is
         "form10_start_share": float(len(recent10) / min(team_games, 10)),
     }
 
-    for field, prior_key in [
-        ("goalie_fp", "goalie_fp"),
-        ("saves", "goalie_saves"),
-        ("shots_against", "goalie_shots_against"),
-        ("save_pct", "goalie_save_pct"),
-    ]:
+    for field, prior_key in GOALIE_PRIOR_FIELDS:
         prior = priors[prior_key]
         summary[f"season_{field}"] = _smoothed_mean(values(field, goalie_history), prior, shrink=6.0)
         summary[f"form5_{field}"] = _smoothed_mean(values(field, recent5), prior, shrink=3.0)
@@ -247,9 +364,13 @@ def build_matchup_feature_row(
     priors,
     away_goalie_summary=None,
     home_goalie_summary=None,
+    away_team_priors=None,
+    home_team_priors=None,
 ):
-    away = summarize_team_history(away_history, game_date, current_is_home=0, priors=priors)
-    home = summarize_team_history(home_history, game_date, current_is_home=1, priors=priors)
+    away_team_priors = away_team_priors or priors
+    home_team_priors = home_team_priors or priors
+    away = summarize_team_history(away_history, game_date, current_is_home=0, priors=away_team_priors)
+    home = summarize_team_history(home_history, game_date, current_is_home=1, priors=home_team_priors)
 
     row = {
         "away_team": away_team,
@@ -297,8 +418,8 @@ def build_matchup_feature_row(
     row["away_home_goalie_fp_form_sum"] = away["form10_goalie_fp"] + home["form10_goalie_fp"]
     row["away_home_goalie_fp_ewm_sum"] = away["ewm_goalie_fp"] + home["ewm_goalie_fp"]
 
-    away_goalie_summary = away_goalie_summary or summarize_goalie_history([], away_history, game_date, 0, priors)
-    home_goalie_summary = home_goalie_summary or summarize_goalie_history([], home_history, game_date, 1, priors)
+    away_goalie_summary = away_goalie_summary or summarize_goalie_history([], away_history, game_date, 0, away_team_priors)
+    home_goalie_summary = home_goalie_summary or summarize_goalie_history([], home_history, game_date, 1, home_team_priors)
 
     for prefix, summary in [("away_goalie", away_goalie_summary), ("home_goalie", home_goalie_summary)]:
         for key, value in summary.items():
@@ -335,6 +456,7 @@ def build_matchup_feature_row(
 
 def build_training_dataframe(games_df):
     priors = compute_priors(games_df)
+    carryover = compute_carryover_priors(games_df, priors)
     histories = defaultdict(list)
     goalie_histories = defaultdict(list)
     rows = []
@@ -350,14 +472,14 @@ def build_training_dataframe(games_df):
             histories[away_key],
             game_date,
             current_is_home=0,
-            priors=priors,
+            priors=goalie_priors_for(carryover, priors, game.season, game.away_goalie_id),
         )
         home_goalie_summary = summarize_goalie_history(
             goalie_histories[home_goalie_key],
             histories[home_key],
             game_date,
             current_is_home=1,
-            priors=priors,
+            priors=goalie_priors_for(carryover, priors, game.season, game.home_goalie_id),
         )
 
         feature_row = build_matchup_feature_row(
@@ -369,6 +491,8 @@ def build_training_dataframe(games_df):
             priors=priors,
             away_goalie_summary=away_goalie_summary,
             home_goalie_summary=home_goalie_summary,
+            away_team_priors=team_priors_for(carryover, priors, game.season, game.away_team),
+            home_team_priors=team_priors_for(carryover, priors, game.season, game.home_team),
         )
         feature_row["season"] = int(game.season)
         feature_row["game_id"] = int(game.game_id)
@@ -439,21 +563,16 @@ def build_training_dataframe(games_df):
 
 
 def feature_columns(training_df):
-    excluded = {
-        "away_team",
-        "home_team",
-        "date",
-        "season",
-        "game_id",
-        "stack_fp",
-        "target_total_goals",
-        "target_total_shots",
-    }
-    return [column for column in training_df.columns if column not in excluded]
+    missing = [column for column in MODEL_FEATURES if column not in training_df.columns]
+    if missing:
+        raise PredictiveStackModelError(f"Training data missing model features: {missing}")
+    return list(MODEL_FEATURES)
 
 
 def build_design_matrix(training_df, numeric_columns, team_codes):
     base = training_df[numeric_columns].to_numpy(dtype=float)
+    if not team_codes:
+        return base, list(numeric_columns)
     away_matrix = np.column_stack(
         [(training_df["away_team"] == code).to_numpy(dtype=float) for code in team_codes]
     )
@@ -542,93 +661,90 @@ def fit_predictive_stack_model(training_df):
         raise PredictiveStackModelError("Need at least 500 historical games to fit the predictive model.")
 
     numeric_columns = feature_columns(training_df)
-    team_codes = sorted(set(training_df["away_team"]).union(set(training_df["home_team"])))
+    team_codes = (
+        sorted(set(training_df["away_team"]).union(set(training_df["home_team"]))) if USE_TEAM_ONE_HOTS else []
+    )
     X, design_columns = build_design_matrix(training_df, numeric_columns, team_codes)
     y_stack = training_df["stack_fp"].to_numpy(dtype=float)
     y_goals = training_df["target_total_goals"].to_numpy(dtype=float)
     y_shots = training_df["target_total_shots"].to_numpy(dtype=float)
 
     n = len(training_df)
-    train_end = int(n * 0.70)
-    val_end = int(n * 0.85)
+    # Rolling-origin folds: train on everything before each cut, score the next 10% of games.
+    folds = [(int(n * start), int(n * (start + CV_FOLD_SIZE))) for start in CV_FOLD_STARTS]
+    if folds[0][0] < 100:
+        raise PredictiveStackModelError("Not enough historical rows for chronological validation folds.")
 
-    if train_end < 100 or val_end <= train_end:
-        raise PredictiveStackModelError("Not enough historical rows for chronological train/validation splits.")
+    def choose_alpha(y):
+        fold_maes = {
+            alpha: np.mean(
+                [_mae(y[end:stop], _predict_ridge(_fit_ridge(X[:end], y[:end], alpha=alpha), X[end:stop])) for end, stop in folds]
+            )
+            for alpha in CANDIDATE_ALPHAS
+        }
+        return min(fold_maes, key=fold_maes.get)
 
-    X_train = X[:train_end]
-    X_val = X[train_end:val_end]
-    X_test = X[val_end:]
+    direct_alpha = choose_alpha(y_stack)
+    goals_alpha = choose_alpha(y_goals)
+    shots_alpha = choose_alpha(y_shots)
 
-    y_stack_train, y_stack_val, y_stack_test = y_stack[:train_end], y_stack[train_end:val_end], y_stack[val_end:]
-    y_goals_train, y_goals_val, y_goals_test = y_goals[:train_end], y_goals[train_end:val_end], y_goals[val_end:]
-    y_shots_train, y_shots_val, y_shots_test = y_shots[:train_end], y_shots[train_end:val_end], y_shots[val_end:]
-
-    candidate_alphas = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
-    def choose_alpha(y_train, y_val):
-        best_alpha = None
-        best_model = None
-        best_mae = None
-        for alpha in candidate_alphas:
-            model = _fit_ridge(X_train, y_train, alpha=alpha)
-            preds = _predict_ridge(model, X_val)
-            mae = _mae(y_val, preds)
-            if best_mae is None or mae < best_mae:
-                best_mae = mae
-                best_alpha = alpha
-                best_model = model
-        return best_alpha, best_model
-
-    direct_alpha, direct_val_model = choose_alpha(y_stack_train, y_stack_val)
-    goals_alpha, goals_val_model = choose_alpha(y_goals_train, y_goals_val)
-    shots_alpha, shots_val_model = choose_alpha(y_shots_train, y_shots_val)
-
-    direct_val_preds = _predict_ridge(direct_val_model, X_val)
-    goals_val_preds = np.clip(_predict_ridge(goals_val_model, X_val), 0.0, None)
-    shots_val_preds = np.clip(_predict_ridge(shots_val_model, X_val), 0.0, None)
-    surface_val = _fit_stack_surface(y_goals_train, y_shots_train, y_stack_train)
-    structural_val_preds = _predict_stack_surface(surface_val, goals_val_preds, shots_val_preds)
+    # Out-of-sample direct and structural (goals + shots -> stack FP) predictions for every fold.
+    fold_direct, fold_structural, fold_actual = [], [], []
+    for end, stop in folds:
+        fold_direct.append(_predict_ridge(_fit_ridge(X[:end], y_stack[:end], alpha=direct_alpha), X[end:stop]))
+        goals_preds = np.clip(_predict_ridge(_fit_ridge(X[:end], y_goals[:end], alpha=goals_alpha), X[end:stop]), 0.0, None)
+        shots_preds = np.clip(_predict_ridge(_fit_ridge(X[:end], y_shots[:end], alpha=shots_alpha), X[end:stop]), 0.0, None)
+        surface = _fit_stack_surface(y_goals[:end], y_shots[:end], y_stack[:end])
+        fold_structural.append(_predict_stack_surface(surface, goals_preds, shots_preds))
+        fold_actual.append(y_stack[end:stop])
+    direct_oos = np.concatenate(fold_direct)
+    structural_oos = np.concatenate(fold_structural)
+    actual_oos = np.concatenate(fold_actual)
 
     best_weight = None
     best_weight_mae = None
     for weight in np.linspace(0.0, 1.0, 11):
-        blended = weight * direct_val_preds + (1.0 - weight) * structural_val_preds
-        mae = _mae(y_stack_val, blended)
+        mae = _mae(actual_oos, weight * direct_oos + (1.0 - weight) * structural_oos)
         if best_weight_mae is None or mae < best_weight_mae:
             best_weight_mae = mae
             best_weight = float(weight)
 
-    direct_test_model = _fit_ridge(X[:val_end], y_stack[:val_end], alpha=direct_alpha)
-    goals_test_model = _fit_ridge(X[:val_end], y_goals[:val_end], alpha=goals_alpha)
-    shots_test_model = _fit_ridge(X[:val_end], y_shots[:val_end], alpha=shots_alpha)
-    surface_test = _fit_stack_surface(y_goals[:val_end], y_shots[:val_end], y_stack[:val_end])
-
-    direct_test_preds = _predict_ridge(direct_test_model, X_test)
-    goals_test_preds = np.clip(_predict_ridge(goals_test_model, X_test), 0.0, None)
-    shots_test_preds = np.clip(_predict_ridge(shots_test_model, X_test), 0.0, None)
-    structural_test_preds = _predict_stack_surface(surface_test, goals_test_preds, shots_test_preds)
-    test_preds = best_weight * direct_test_preds + (1.0 - best_weight) * structural_test_preds
-    validation_preds = best_weight * direct_val_preds + (1.0 - best_weight) * structural_val_preds
+    oos_preds = best_weight * direct_oos + (1.0 - best_weight) * structural_oos
+    last_fold_size = len(fold_actual[-1])
+    validation_metrics = {
+        "mae": _mae(actual_oos, oos_preds),
+        "rmse": _rmse(actual_oos, oos_preds),
+        "spearman": _spearman(actual_oos, oos_preds),
+        "baseline_mae": float(
+            np.mean(np.concatenate([np.abs(y_stack[end:stop] - y_stack[:end].mean()) for end, stop in folds]))
+        ),
+    }
+    test_metrics = {
+        "mae": _mae(actual_oos[-last_fold_size:], oos_preds[-last_fold_size:]),
+        "rmse": _rmse(actual_oos[-last_fold_size:], oos_preds[-last_fold_size:]),
+        "spearman": _spearman(actual_oos[-last_fold_size:], oos_preds[-last_fold_size:]),
+    }
+    residual_std = float(np.std(actual_oos - oos_preds, ddof=1))
 
     direct_final_model = _fit_ridge(X, y_stack, alpha=direct_alpha)
     goals_final_model = _fit_ridge(X, y_goals, alpha=goals_alpha)
     shots_final_model = _fit_ridge(X, y_shots, alpha=shots_alpha)
     final_surface = _fit_stack_surface(y_goals, y_shots, y_stack)
 
-    validation_metrics = {
-        "mae": _mae(y_stack_val, validation_preds),
-        "rmse": _rmse(y_stack_val, validation_preds),
-        "spearman": _spearman(y_stack_val, validation_preds),
-    }
-    test_metrics = {
-        "mae": _mae(y_stack_test, test_preds),
-        "rmse": _rmse(y_stack_test, test_preds),
-        "spearman": _spearman(y_stack_test, test_preds),
-    }
-    residual_std = (
-        float(np.std(y_stack_test - test_preds, ddof=1))
-        if len(y_stack_test) > 1
-        else float(np.std(y_stack - _predict_ridge(direct_final_model, X)))
+    # Cut tiers from the final model's predictions on the most recent games, so they track
+    # the current scoring environment instead of older seasons.
+    recent_X = X[-TIER_WINDOW_GAMES:]
+    recent_goals = np.clip(_predict_ridge(goals_final_model, recent_X), 0.0, None)
+    recent_shots = np.clip(_predict_ridge(shots_final_model, recent_X), 0.0, None)
+    recent_preds = best_weight * _predict_ridge(direct_final_model, recent_X) + (1.0 - best_weight) * _predict_stack_surface(
+        final_surface, recent_goals, recent_shots
     )
+    tier_thresholds = [
+        {"tier": tier, "min_predicted_stack_fp": float(np.percentile(recent_preds, pct))}
+        for tier, pct in TIER_PERCENTILES
+    ]
+    train_end = folds[0][0]
+    val_end = n
 
     artifact = {
         "model_type": "ensemble_stack_model",
@@ -655,6 +771,7 @@ def fit_predictive_stack_model(training_df):
         "latest_training_date": str(training_df.iloc[-1]["date"].date()),
         "validation_metrics": validation_metrics,
         "test_metrics": test_metrics,
+        "tier_thresholds": tier_thresholds,
     }
     return artifact
 
@@ -756,11 +873,8 @@ def build_histories_through_date(games_df, target_date):
 
 
 def infer_target_season(games_df, target_date):
-    cutoff = pd.Timestamp(target_date).normalize()
-    prior_games = games_df.loc[games_df["date"] < cutoff]
-    if prior_games.empty:
-        return int(games_df["season"].max())
-    return int(prior_games["season"].max())
+    # Based on the calendar, not the last game played, so opening day starts a fresh season.
+    return season_for_date(target_date)
 
 
 def _standard_normal_cdf(x):
@@ -802,6 +916,7 @@ def infer_goalie_start_probabilities(
     game_date,
     current_is_home,
     priors,
+    carryover=None,
 ):
     if not candidates:
         return []
@@ -813,7 +928,13 @@ def infer_goalie_start_probabilities(
     scored_candidates = []
     for candidate in candidates:
         goalie_history = goalie_histories.get((season, team_code, candidate["goalie_id"]), [])
-        summary = summarize_goalie_history(goalie_history, team_history, game_date, current_is_home, priors)
+        summary = summarize_goalie_history(
+            goalie_history,
+            team_history,
+            game_date,
+            current_is_home,
+            goalie_priors_for(carryover, priors, season, candidate["goalie_id"]),
+        )
 
         season_share = summary["season_start_share"]
         form_share = summary["form5_start_share"]
@@ -863,7 +984,14 @@ def infer_goalie_start_probabilities(
     return sorted(results, key=lambda row: row["start_probability"], reverse=True)
 
 
-def classify_stack_tier(predicted_stack_fp, prob_positive, prob_5_plus):
+def classify_stack_tier(predicted_stack_fp, prob_positive, prob_5_plus, tier_thresholds=None):
+    if tier_thresholds:
+        for threshold in tier_thresholds:
+            if predicted_stack_fp >= threshold["min_predicted_stack_fp"]:
+                return threshold["tier"]
+        return "FADE"
+
+    # Fixed cutoffs for artifacts trained before percentile tiers existed.
     if predicted_stack_fp >= 4.25 or prob_5_plus >= 0.42:
         return "CORE STACK"
     if predicted_stack_fp >= 3.0 or prob_5_plus >= 0.30:
@@ -883,9 +1011,14 @@ def evaluate_matchup_with_model(
     artifact,
     away_goalie_candidates=None,
     home_goalie_candidates=None,
+    carryover=None,
 ):
     priors = artifact["priors"]
     season = infer_target_season(games_df, target_date)
+    if carryover is None:
+        carryover = compute_carryover_priors(games_df, priors, extra_seasons=[season])
+    away_team_priors = team_priors_for(carryover, priors, season, away_team)
+    home_team_priors = team_priors_for(carryover, priors, season, home_team)
     histories, goalie_histories = build_histories_through_date(games_df, target_date)
     game_date = pd.Timestamp(target_date).normalize()
 
@@ -894,7 +1027,8 @@ def evaluate_matchup_with_model(
 
     def build_goalie_summary(candidate, team, is_home, team_history):
         goalie_history = goalie_histories[(season, team, candidate["goalie_id"])]
-        return summarize_goalie_history(goalie_history, team_history, game_date, is_home, priors)
+        goalie_priors = goalie_priors_for(carryover, priors, season, candidate["goalie_id"])
+        return summarize_goalie_history(goalie_history, team_history, game_date, is_home, goalie_priors)
 
     if away_goalie_candidates:
         away_goalies = [
@@ -911,7 +1045,7 @@ def evaluate_matchup_with_model(
             {
                 "goalie_id": None,
                 "goalie_name": "Team Average",
-                "summary": summarize_goalie_history([], away_team_history, game_date, 0, priors),
+                "summary": summarize_goalie_history([], away_team_history, game_date, 0, away_team_priors),
                 "start_probability": 1.0,
             }
         ]
@@ -931,7 +1065,7 @@ def evaluate_matchup_with_model(
             {
                 "goalie_id": None,
                 "goalie_name": "Team Average",
-                "summary": summarize_goalie_history([], home_team_history, game_date, 1, priors),
+                "summary": summarize_goalie_history([], home_team_history, game_date, 1, home_team_priors),
                 "start_probability": 1.0,
             }
         ]
@@ -949,6 +1083,8 @@ def evaluate_matchup_with_model(
                 priors=priors,
                 away_goalie_summary=away_goalie["summary"],
                 home_goalie_summary=home_goalie["summary"],
+                away_team_priors=away_team_priors,
+                home_team_priors=home_team_priors,
             )
 
             numeric_values = [float(feature_row[column]) for column in artifact["numeric_feature_columns"]]
@@ -1018,7 +1154,12 @@ def evaluate_matchup_with_model(
         "predicted_stack_fp": round(weighted_stack_fp, 2),
         "prob_positive": round(weighted_prob_positive, 3),
         "prob_5_plus": round(weighted_prob_5_plus, 3),
-        "tier": classify_stack_tier(weighted_stack_fp, weighted_prob_positive, weighted_prob_5_plus),
+        "tier": classify_stack_tier(
+            weighted_stack_fp,
+            weighted_prob_positive,
+            weighted_prob_5_plus,
+            tier_thresholds=artifact.get("tier_thresholds"),
+        ),
         "predicted_total_goals": round(weighted_goals, 2),
         "predicted_total_shots": round(weighted_shots, 2),
         "season_expected_goals": round(top_pair["feature_row"]["season_expected_goals"], 2),

@@ -55,15 +55,15 @@ A master dataset is maintained and updated automatically.
 ## Project Structure
 
 ```
-├── main.py
 ├── scripts/
+│   ├── main.py
 │   ├── stack_predictive_model.py
 │   ├── update_goalie_stack_data.py
 │   └── update_team_data.py
 ├── data/
 │   ├── goalie_stack_games_master.csv
-│   └── team_data.csv
-├── stack_predictive_model.json
+│   ├── team_data.csv
+│   └── stack_predictive_model.json
 ```
 
 ## How to Run
@@ -77,7 +77,7 @@ pip install pandas numpy requests
 Run:
 
 ```
-python main.py
+python scripts/main.py
 ```
 
 This will:

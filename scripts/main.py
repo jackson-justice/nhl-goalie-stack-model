@@ -7,6 +7,7 @@ import requests
 from stack_predictive_model import (
     PredictiveStackModelError,
     build_histories_through_date,
+    compute_carryover_priors,
     evaluate_matchup_with_model,
     extract_goalie_candidates,
     fetch_gamecenter_landing,
@@ -21,7 +22,7 @@ from update_team_data import TeamDataUpdateError, update_team_data_csv
 
 
 SCHEDULE_URL = "https://api-web.nhle.com/v1/schedule/{date_str}"
-DEFAULT_TEAM_DATA_PATH = Path(__file__).with_name("team_data.csv")
+DEFAULT_TEAM_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "team_data.csv"
 
 
 class ScheduleFetchError(RuntimeError):
@@ -77,6 +78,7 @@ def evaluate_todays_schedule(date_str=None, team_data_path=DEFAULT_TEAM_DATA_PAT
     artifact = load_model_artifact()
     season = infer_target_season(games_df, target_date)
     team_histories, goalie_histories = build_histories_through_date(games_df, target_date)
+    carryover = compute_carryover_priors(games_df, artifact["priors"], extra_seasons=[season])
     evaluated_games = []
     skipped_games = []
 
@@ -97,6 +99,7 @@ def evaluate_todays_schedule(date_str=None, team_data_path=DEFAULT_TEAM_DATA_PAT
                 game_date=pd.Timestamp(target_date).normalize(),
                 current_is_home=0,
                 priors=artifact["priors"],
+                carryover=carryover,
             )
             home_goalies = infer_goalie_start_probabilities(
                 season=season,
@@ -107,6 +110,7 @@ def evaluate_todays_schedule(date_str=None, team_data_path=DEFAULT_TEAM_DATA_PAT
                 game_date=pd.Timestamp(target_date).normalize(),
                 current_is_home=1,
                 priors=artifact["priors"],
+                carryover=carryover,
             )
 
             result = evaluate_matchup_with_model(
@@ -117,6 +121,7 @@ def evaluate_todays_schedule(date_str=None, team_data_path=DEFAULT_TEAM_DATA_PAT
                 artifact,
                 away_goalie_candidates=away_goalies,
                 home_goalie_candidates=home_goalies,
+                carryover=carryover,
             )
         except Exception as exc:
             skipped_games.append(
@@ -144,6 +149,7 @@ def evaluate_todays_schedule(date_str=None, team_data_path=DEFAULT_TEAM_DATA_PAT
             "goals_alpha": artifact["goals_alpha"],
             "shots_alpha": artifact["shots_alpha"],
             "validation_mae": round(artifact["validation_metrics"]["mae"], 3),
+            "baseline_mae": round(artifact["validation_metrics"].get("baseline_mae", float("nan")), 3),
             "validation_rmse": round(artifact["validation_metrics"]["rmse"], 3),
             "validation_spearman": round(artifact["validation_metrics"]["spearman"], 3),
             "latest_training_date": artifact["latest_training_date"],
@@ -160,7 +166,7 @@ def print_ranked_report(report):
         f"Model: ensemble ridge | games={model_info['training_rows']} | "
         f"w_direct={model_info['ensemble_weight_direct']:.2f} | "
         f"alphas=({model_info['direct_alpha']}, {model_info['goals_alpha']}, {model_info['shots_alpha']}) | "
-        f"val_mae={model_info['validation_mae']:.3f} | "
+        f"val_mae={model_info['validation_mae']:.3f} (avg-guess {model_info['baseline_mae']:.3f}) | "
         f"val_rmse={model_info['validation_rmse']:.3f} | "
         f"val_spearman={model_info['validation_spearman']:.3f} | "
         f"through={model_info['latest_training_date']}"

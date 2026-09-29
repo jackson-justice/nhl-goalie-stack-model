@@ -4,7 +4,10 @@ import time
 from pathlib import Path
 
 
-OUTPUT_FILE = "goalie_stack_games_master.csv"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+OUTPUT_FILE = DATA_DIR / "goalie_stack_games_master.csv"
+PARTIAL_FILE = DATA_DIR / "goalie_stack_games_partial.csv"
+DEFAULT_START_DATE = "2023-10-01"
 GAME_COLUMNS = [
     "game_id",
     "date",
@@ -69,7 +72,8 @@ def get_games_for_date(date_str):
     for game_day in data.get("gameWeek", []):
         if game_day.get("date") == date_str:
             for game in game_day.get("games", []):
-                if game.get("gameState") == "OFF":   # completed games only
+                # completed regular-season (2) and playoff (3) games only
+                if game.get("gameState") == "OFF" and game.get("gameType") in (2, 3):
                     games.append(game)
     return games
 
@@ -151,7 +155,7 @@ def collect_games(start_date, end_date, partial_save_every=100):
 
             if len(rows) > 0 and len(rows) % partial_save_every == 0:
                 pd.DataFrame(rows).drop_duplicates(subset="game_id").to_csv(
-                    "goalie_stack_games_partial.csv", index=False
+                    PARTIAL_FILE, index=False
                 )
                 print("  Partial save complete.")
 
@@ -164,7 +168,38 @@ def collect_games(start_date, end_date, partial_save_every=100):
     return df
 
 
+def update_master_csv(output_file=OUTPUT_FILE, end_date=None):
+    """Append completed games since the latest date in the master CSV (or build it from scratch)."""
+    output_file = Path(output_file)
+    end = pd.Timestamp(end_date) if end_date else pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
+
+    if output_file.exists():
+        existing = pd.read_csv(output_file)
+        latest = pd.to_datetime(existing["date"], format="mixed").max().normalize()
+        # Re-check the latest date in case some of its games weren't final on the last run.
+        start = latest
+    else:
+        existing = pd.DataFrame(columns=GAME_COLUMNS)
+        start = pd.Timestamp(DEFAULT_START_DATE)
+
+    if start > end:
+        print(f"{output_file.name} is up to date through {end.date()}.")
+        return existing
+
+    print(f"Updating {output_file.name} from {start.date()} to {end.date()}...")
+    new_games = collect_games(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    if new_games.empty:
+        print("No new completed games found.")
+        return existing
+
+    frames = [df for df in (existing, new_games) if not df.empty]
+    combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset="game_id", keep="last")
+    combined["date"] = pd.to_datetime(combined["date"], format="mixed").dt.strftime("%Y-%m-%d")
+    combined = combined.sort_values(["date", "game_id"]).reset_index(drop=True)
+    combined.to_csv(output_file, index=False)
+    print(f"Saved {len(combined)} games to {output_file.name} ({len(combined) - len(existing)} new).")
+    return combined
+
+
 if __name__ == "__main__":
-    df = collect_games("2023-10-01", "2026-03-17")
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"\nSaved {len(df)} games to {OUTPUT_FILE}")
+    update_master_csv()
