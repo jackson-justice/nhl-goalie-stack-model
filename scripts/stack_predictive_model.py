@@ -60,6 +60,16 @@ TIER_PERCENTILES = [("CORE STACK", 90), ("STRONG STACK", 75), ("THIN EDGE STACK"
 TIER_WINDOW_GAMES = 500
 CV_FOLD_STARTS = (0.5, 0.6, 0.7, 0.8, 0.9)
 CV_FOLD_SIZE = 0.1
+# Starting-goalie choice is a softmax over these scores. Weights were fit as a conditional logit on
+# 2024-25 and 2025-26 regular-season starts (fit on 2024-25 alone, they cut 2025-26 log loss from
+# 0.82 to 0.77 vs the old hand-set weights, and from 0.91 to 0.72 over each team's first 10 games).
+STARTER_WEIGHTS = {
+    "season_share": 1.327,
+    "form5_share": 2.709,
+    "started_last": -0.567,
+    "back_to_back_started_last": -2.4,
+}
+STARTER_PRIOR_GAMES = 5.0
 
 
 class PredictiveStackModelError(RuntimeError):
@@ -333,6 +343,14 @@ def summarize_goalie_history(goalie_history, team_history, game_date, current_is
     recent10 = goalie_history[-10:]
     venue_history = [item for item in goalie_history if item["is_home"] == current_is_home]
     team_games = max(len(team_history), 1)
+    goalie_id = goalie_history[-1]["goalie_id"] if goalie_history else None
+
+    def recent_start_share(n):
+        # Share of the team's last n games this goalie started (not his own last n starts).
+        recent_team = team_history[-n:]
+        if not recent_team or goalie_id is None:
+            return 0.0
+        return sum(item.get("goalie_id") == goalie_id for item in recent_team) / len(recent_team)
 
     summary = {
         "gp": float(gp),
@@ -340,8 +358,8 @@ def summarize_goalie_history(goalie_history, team_history, game_date, current_is
         "started_last_game": started_last_game,
         "consecutive_starts": consecutive_team_starts,
         "season_start_share": float(gp / team_games),
-        "form5_start_share": float(len(recent5) / min(team_games, 5)),
-        "form10_start_share": float(len(recent10) / min(team_games, 10)),
+        "form5_start_share": float(recent_start_share(5)),
+        "form10_start_share": float(recent_start_share(10)),
     }
 
     for field, prior_key in GOALIE_PRIOR_FIELDS:
@@ -924,6 +942,9 @@ def infer_goalie_start_probabilities(
     team_back_to_back = 0.0
     if team_history:
         team_back_to_back = 1.0 if max(1.0, float((game_date - team_history[-1]["date"]).days)) <= 1.0 else 0.0
+    team_games = float(len(team_history))
+    recent_games = float(min(len(team_history), 5))
+    total_preview_gp = max(sum(item["games_played"] for item in candidates), 1.0)
 
     scored_candidates = []
     for candidate in candidates:
@@ -936,26 +957,19 @@ def infer_goalie_start_probabilities(
             goalie_priors_for(carryover, priors, season, candidate["goalie_id"]),
         )
 
-        season_share = summary["season_start_share"]
-        form_share = summary["form5_start_share"]
-        fp_form = summary["form10_goalie_fp"]
-        save_pct = summary["season_save_pct"]
+        # The preview's games played (last season's early on) seeds the start shares as pseudo-games,
+        # so opening-week picks lean on last season's usage until this season's starts take over.
+        preview_share = candidate["games_played"] / total_preview_gp
+        season_share = (summary["gp"] + STARTER_PRIOR_GAMES * preview_share) / (team_games + STARTER_PRIOR_GAMES)
+        form_share = (summary["form5_start_share"] * recent_games + 2.0 * preview_share) / (recent_games + 2.0)
         started_last = summary["started_last_game"]
-        rest_days = summary["rest_days"]
 
-        score = 3.0 * season_share + 1.5 * form_share + 0.08 * fp_form + 4.0 * (save_pct - priors["goalie_save_pct"])
-        if team_back_to_back and started_last:
-            score -= 2.5
-        elif team_back_to_back and not started_last:
-            score += 1.0
-        elif started_last:
-            score += 0.35
-        score += 0.15 * min(rest_days, 4.0)
-
-        # Fall back toward current season usage from preview payload if historical starts are sparse.
-        if summary["gp"] < 3:
-            total_gp = max(sum(item["games_played"] for item in candidates), 1.0)
-            score += 2.0 * (candidate["games_played"] / total_gp)
+        score = (
+            STARTER_WEIGHTS["season_share"] * season_share
+            + STARTER_WEIGHTS["form5_share"] * form_share
+            + STARTER_WEIGHTS["started_last"] * started_last
+            + STARTER_WEIGHTS["back_to_back_started_last"] * team_back_to_back * started_last
+        )
 
         scored_candidates.append(
             {

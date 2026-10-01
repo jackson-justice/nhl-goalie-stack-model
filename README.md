@@ -50,6 +50,8 @@ Data is collected from the NHL API:
 * goalie stats (saves, shots, goals allowed)
 * team-level statistics
 
+Pregame betting lines (game total and moneyline) come from ESPN's public odds feed via `scripts/update_odds_data.py` and are stored in `data/game_odds.csv`. They are collected but not yet used by the model.
+
 A master dataset is maintained and updated automatically.
 
 ## Project Structure
@@ -59,9 +61,11 @@ A master dataset is maintained and updated automatically.
 │   ├── main.py
 │   ├── stack_predictive_model.py
 │   ├── update_goalie_stack_data.py
+│   ├── update_odds_data.py
 │   └── update_team_data.py
 ├── data/
 │   ├── goalie_stack_games_master.csv
+│   ├── game_odds.csv
 │   ├── team_data.csv
 │   └── stack_predictive_model.json
 ```
