@@ -11,6 +11,7 @@ import requests
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MASTER_FILE = DATA_DIR / "goalie_stack_games_master.csv"
 MODEL_ARTIFACT_PATH = DATA_DIR / "stack_predictive_model.json"
+ODDS_FILE = DATA_DIR / "game_odds.csv"
 GAMECENTER_LANDING_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/landing"
 
 ROLLING_WINDOWS = (5, 10)
@@ -32,27 +33,25 @@ GOALIE_CARRYOVER_SHRINK = 200.0
 ROOKIE_PRIOR_STARTS = 20
 ROOKIE_PRIOR_MIN_SAMPLES = 50
 
-# The model uses a small core of features. With ~4,000 noisy games, the full ~200-feature set
-# plus team one-hots overfit and did no better than predicting the league average on 2025-26.
+# The stack model uses a small core of features: shot volume (the predictable part of a stack)
+# plus the betting market's view of the game. Box-score goal features add nothing once the
+# market total is in. Even so, stack FP is mostly noise: on 2025-26 held out, the top fifth of
+# games averaged ~1.6 FP more than the bottom fifth, and on 2024-25 there was no edge at all.
 MODEL_FEATURES = [
-    "season_expected_goals",
     "season_expected_shots",
-    "ewm_expected_goals",
     "ewm_expected_shots",
-    "venue_expected_goals",
     "venue_expected_shots",
     "season_pace_mean",
-    "season_stack_env_mean",
-    "goalie_fp_sum",
-    "goalie_fp_form_sum",
-    "goalie_save_pct_mean",
-    "goalie_save_pct_form_mean",
-    "away_home_goalie_fp_form_sum",
     "goalie_shots_against_mean",
-    "rest_sum",
-    "back_to_back_count",
-    "goalie_start_share_sum",
+    "goalie_save_pct_mean",
+    "goalie_fp_sum",
+    "market_total_goals",
+    "market_fav_prob",
 ]
+# Single-goalie model. The moneyline carries most of the signal (the win is worth 4 FP); goalie
+# stats like save % added nothing on top of the market, which already prices in the starter.
+GOALIE_FEATURES = ["win_prob", "market_total_goals", "exp_shots_against", "exp_shots_against_ewm"]
+DEFAULT_MARKET_HOME_WIN_PROB = 0.54
 USE_TEAM_ONE_HOTS = False
 CANDIDATE_ALPHAS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0, 100000.0]
 # Tiers are percentiles of out-of-sample predictions: CORE = top 10% of games, STRONG = next 15%, etc.
@@ -384,6 +383,7 @@ def build_matchup_feature_row(
     home_goalie_summary=None,
     away_team_priors=None,
     home_team_priors=None,
+    market=None,
 ):
     away_team_priors = away_team_priors or priors
     home_team_priors = home_team_priors or priors
@@ -469,11 +469,60 @@ def build_matchup_feature_row(
         away_goalie_summary["season_shots_against"] + home_goalie_summary["season_shots_against"]
     )
 
+    add_market_features(row, market, priors)
     return row
 
 
-def build_training_dataframe(games_df):
+def _present(value):
+    return value is not None and not (isinstance(value, float) and math.isnan(value))
+
+
+def add_market_features(row, market, priors):
+    """Betting-market features, falling back to the team-based estimates when there's no line."""
+    market = market or {}
+    total = market.get("market_total_goals")
+    home_win_prob = market.get("market_home_win_prob")
+    row["has_market_total"] = 1.0 if _present(total) else 0.0
+    row["market_total_goals"] = float(total) if _present(total) else row["season_expected_goals"]
+    home_win_prob = (
+        float(home_win_prob)
+        if _present(home_win_prob)
+        else float(priors.get("market_home_win_prob", DEFAULT_MARKET_HOME_WIN_PROB))
+    )
+    row["market_home_win_prob"] = home_win_prob
+    row["market_fav_prob"] = max(home_win_prob, 1.0 - home_win_prob)
+    return row
+
+
+def goalie_feature_rows(row):
+    """Per-side single-goalie features from a matchup feature row: {"away": {...}, "home": {...}}."""
+    sides = {}
+    for side, opponent, is_home in (("away", "home", 0), ("home", "away", 1)):
+        home_win_prob = row["market_home_win_prob"]
+        sides[side] = {
+            "win_prob": home_win_prob if is_home else 1.0 - home_win_prob,
+            "market_total_goals": row["market_total_goals"],
+            "exp_shots_against": 0.5 * (row[f"{side}_season_sa"] + row[f"{opponent}_season_sf"]),
+            "exp_shots_against_ewm": 0.5 * (row[f"{side}_ewm_sa"] + row[f"{opponent}_ewm_sf"]),
+        }
+    return sides
+
+
+def market_lookup(odds_df):
+    """{game_id: {market_total_goals, market_home_win_prob}} from the odds file."""
+    if odds_df is None or odds_df.empty:
+        return {}
+    columns = ["market_total_goals", "market_home_win_prob"]
+    return {int(row.game_id): {column: getattr(row, column) for column in columns} for row in odds_df.itertuples(index=False)}
+
+
+def build_training_dataframe(games_df, odds_df=None):
     priors = compute_priors(games_df)
+    markets = market_lookup(odds_df)
+    if markets:
+        home_win_probs = [value["market_home_win_prob"] for value in markets.values() if _present(value["market_home_win_prob"])]
+        if home_win_probs:
+            priors["market_home_win_prob"] = float(np.mean(home_win_probs))
     carryover = compute_carryover_priors(games_df, priors)
     histories = defaultdict(list)
     goalie_histories = defaultdict(list)
@@ -511,10 +560,13 @@ def build_training_dataframe(games_df):
             home_goalie_summary=home_goalie_summary,
             away_team_priors=team_priors_for(carryover, priors, game.season, game.away_team),
             home_team_priors=team_priors_for(carryover, priors, game.season, game.home_team),
+            market=markets.get(int(game.game_id)),
         )
         feature_row["season"] = int(game.season)
         feature_row["game_id"] = int(game.game_id)
         feature_row["stack_fp"] = float(game.stack_fp)
+        feature_row["away_fp"] = float(game.away_fp)
+        feature_row["home_fp"] = float(game.home_fp)
         feature_row["target_total_goals"] = float(game.total_goals)
         feature_row["target_total_shots"] = float(game.total_shots)
         rows.append(feature_row)
@@ -674,6 +726,87 @@ def _spearman(y_true, y_pred):
     return float(true_rank.corr(pred_rank))
 
 
+def _rolling_folds(n):
+    """Rolling-origin folds: train on everything before each cut, score the next 10% of rows."""
+    folds = [(int(n * start), int(n * (start + CV_FOLD_SIZE))) for start in CV_FOLD_STARTS]
+    if folds[0][0] < 100:
+        raise PredictiveStackModelError("Not enough historical rows for chronological validation folds.")
+    return folds
+
+
+def _choose_alpha(X, y, folds):
+    fold_maes = {
+        alpha: np.mean(
+            [_mae(y[end:stop], _predict_ridge(_fit_ridge(X[:end], y[:end], alpha=alpha), X[end:stop])) for end, stop in folds]
+        )
+        for alpha in CANDIDATE_ALPHAS
+    }
+    return min(fold_maes, key=fold_maes.get)
+
+
+def _quintile_spread(y_true, y_pred):
+    """Average actual result in the top and bottom fifth of predictions."""
+    order = np.argsort(y_pred)
+    fifth = max(len(order) // 5, 1)
+    return float(np.mean(y_true[order[-fifth:]])), float(np.mean(y_true[order[:fifth]]))
+
+
+def build_goalie_dataframe(training_df):
+    """Two rows per game (one per starting goalie) with single-goalie features and FP."""
+    rows = []
+    for row in training_df.to_dict("records"):
+        sides = goalie_feature_rows(row)
+        for side in ("away", "home"):
+            rows.append({"date": row["date"], "game_id": row["game_id"], "fp": row[f"{side}_fp"], **sides[side]})
+    return pd.DataFrame(rows)
+
+
+def fit_goalie_model(training_df):
+    goalie_df = build_goalie_dataframe(training_df)
+    X = goalie_df[GOALIE_FEATURES].to_numpy(dtype=float)
+    y = goalie_df["fp"].to_numpy(dtype=float)
+    folds = _rolling_folds(len(goalie_df))
+    alpha = _choose_alpha(X, y, folds)
+
+    oos_pred = np.concatenate([_predict_ridge(_fit_ridge(X[:end], y[:end], alpha=alpha), X[end:stop]) for end, stop in folds])
+    oos_actual = np.concatenate([y[end:stop] for end, stop in folds])
+    top, bottom = _quintile_spread(oos_actual, oos_pred)
+    final = _fit_ridge(X, y, alpha=alpha)
+    return {
+        "features": list(GOALIE_FEATURES),
+        "alpha": float(alpha),
+        "x_mean": final["x_mean"].tolist(),
+        "x_std": final["x_std"].tolist(),
+        "y_mean": float(final["y_mean"]),
+        "beta": final["beta"].tolist(),
+        # FP is lumpy (a win is +4, a shutout +3), so probabilities come from the actual spread of
+        # out-of-sample misses rather than a bell curve.
+        "residual_quantiles": np.percentile(oos_actual - oos_pred, np.arange(101)).tolist(),
+        "validation_metrics": {
+            "mae": _mae(oos_actual, oos_pred),
+            "baseline_mae": float(
+                np.mean(np.concatenate([np.abs(y[end:stop] - y[:end].mean()) for end, stop in folds]))
+            ),
+            "spearman": _spearman(oos_actual, oos_pred),
+            "top_fifth_fp": top,
+            "bottom_fifth_fp": bottom,
+        },
+    }
+
+
+def predict_goalie_fp(goalie_model, features):
+    X = np.array([[float(features[column]) for column in goalie_model["features"]]], dtype=float)
+    model = {key: np.array(goalie_model[key], dtype=float) for key in ("x_mean", "x_std", "beta")}
+    model["y_mean"] = float(goalie_model["y_mean"])
+    return float(_predict_ridge(model, X)[0])
+
+
+def prob_goalie_fp_at_least(goalie_model, predicted_fp, threshold):
+    quantiles = np.array(goalie_model["residual_quantiles"], dtype=float)
+    cdf = np.interp(threshold - predicted_fp, quantiles, np.linspace(0.0, 1.0, len(quantiles)))
+    return float(1.0 - cdf)
+
+
 def fit_predictive_stack_model(training_df):
     if len(training_df) < 500:
         raise PredictiveStackModelError("Need at least 500 historical games to fit the predictive model.")
@@ -688,23 +821,10 @@ def fit_predictive_stack_model(training_df):
     y_shots = training_df["target_total_shots"].to_numpy(dtype=float)
 
     n = len(training_df)
-    # Rolling-origin folds: train on everything before each cut, score the next 10% of games.
-    folds = [(int(n * start), int(n * (start + CV_FOLD_SIZE))) for start in CV_FOLD_STARTS]
-    if folds[0][0] < 100:
-        raise PredictiveStackModelError("Not enough historical rows for chronological validation folds.")
-
-    def choose_alpha(y):
-        fold_maes = {
-            alpha: np.mean(
-                [_mae(y[end:stop], _predict_ridge(_fit_ridge(X[:end], y[:end], alpha=alpha), X[end:stop])) for end, stop in folds]
-            )
-            for alpha in CANDIDATE_ALPHAS
-        }
-        return min(fold_maes, key=fold_maes.get)
-
-    direct_alpha = choose_alpha(y_stack)
-    goals_alpha = choose_alpha(y_goals)
-    shots_alpha = choose_alpha(y_shots)
+    folds = _rolling_folds(n)
+    direct_alpha = _choose_alpha(X, y_stack, folds)
+    goals_alpha = _choose_alpha(X, y_goals, folds)
+    shots_alpha = _choose_alpha(X, y_shots, folds)
 
     # Out-of-sample direct and structural (goals + shots -> stack FP) predictions for every fold.
     fold_direct, fold_structural, fold_actual = [], [], []
@@ -737,6 +857,7 @@ def fit_predictive_stack_model(training_df):
             np.mean(np.concatenate([np.abs(y_stack[end:stop] - y_stack[:end].mean()) for end, stop in folds]))
         ),
     }
+    validation_metrics["top_fifth_fp"], validation_metrics["bottom_fifth_fp"] = _quintile_spread(actual_oos, oos_preds)
     test_metrics = {
         "mae": _mae(actual_oos[-last_fold_size:], oos_preds[-last_fold_size:]),
         "rmse": _rmse(actual_oos[-last_fold_size:], oos_preds[-last_fold_size:]),
@@ -808,10 +929,18 @@ def load_model_artifact(artifact_path=MODEL_ARTIFACT_PATH):
         return json.load(f)
 
 
-def update_predictive_stack_model(master_file=MASTER_FILE, output_path=MODEL_ARTIFACT_PATH):
+def load_odds(odds_file=ODDS_FILE):
+    path = Path(odds_file)
+    if not path.exists():
+        return pd.DataFrame(columns=["game_id", "market_total_goals", "market_home_win_prob"])
+    return pd.read_csv(path)
+
+
+def update_predictive_stack_model(master_file=MASTER_FILE, output_path=MODEL_ARTIFACT_PATH, odds_file=ODDS_FILE):
     games_df = load_master_games(master_file)
-    training_df, priors = build_training_dataframe(games_df)
+    training_df, priors = build_training_dataframe(games_df, load_odds(odds_file))
     artifact = fit_predictive_stack_model(training_df)
+    artifact["goalie_model"] = fit_goalie_model(training_df)
     artifact["priors"] = priors
     save_model_artifact(artifact, output_path=output_path)
     return artifact
@@ -1026,6 +1155,7 @@ def evaluate_matchup_with_model(
     away_goalie_candidates=None,
     home_goalie_candidates=None,
     carryover=None,
+    market=None,
 ):
     priors = artifact["priors"]
     season = infer_target_season(games_df, target_date)
@@ -1099,6 +1229,7 @@ def evaluate_matchup_with_model(
                 home_goalie_summary=home_goalie["summary"],
                 away_team_priors=away_team_priors,
                 home_team_priors=home_team_priors,
+                market=market,
             )
 
             numeric_values = [float(feature_row[column]) for column in artifact["numeric_feature_columns"]]
@@ -1161,6 +1292,20 @@ def evaluate_matchup_with_model(
     weighted_prob_5_plus = sum(pair["pair_probability"] * pair["prob_5_plus"] for pair in pair_results)
     top_pair = max(pair_results, key=lambda pair: pair["pair_probability"])
 
+    # Single-goalie projections use team- and market-level inputs, so they hold for whoever starts.
+    goalie_projections = {}
+    goalie_model = artifact.get("goalie_model")
+    if goalie_model:
+        for side, features in goalie_feature_rows(top_pair["feature_row"]).items():
+            predicted_fp = predict_goalie_fp(goalie_model, features)
+            goalie_projections[side] = {
+                "predicted_fp": round(predicted_fp, 2),
+                "prob_positive": round(prob_goalie_fp_at_least(goalie_model, predicted_fp, 1e-9), 3),
+                "prob_5_plus": round(prob_goalie_fp_at_least(goalie_model, predicted_fp, 5.0), 3),
+                "win_prob": round(features["win_prob"], 3),
+                "expected_shots_against": round(features["exp_shots_against"], 1),
+            }
+
     return {
         "matchup": f"{away_team} vs {home_team}",
         "team_a": away_team,
@@ -1188,6 +1333,9 @@ def evaluate_matchup_with_model(
         "likely_home_goalie_prob": round(home_goalies[0]["start_probability"], 3),
         "top_goalie_pair": f"{top_pair['away_goalie_name']} + {top_pair['home_goalie_name']}",
         "top_goalie_pair_prob": round(top_pair["pair_probability"], 3),
+        "has_market_line": bool(top_pair["feature_row"]["has_market_total"]),
+        "market_total_goals": round(top_pair["feature_row"]["market_total_goals"], 2),
+        "goalie_projections": goalie_projections,
         "pair_results": [
             {
                 "pair": f"{pair['away_goalie_name']} + {pair['home_goalie_name']}",
